@@ -18,6 +18,7 @@ import type {
   PreviewResponse,
   CompleteResponse,
 } from '@/lib/types';
+import { Progress } from '@/components/ui/progress';
 
 export default function Home() {
   const [state, setState] = useState<AppState>({
@@ -233,6 +234,46 @@ export default function Home() {
     }
   }, [state.downloadUrl]);
 
+  const handleFillFieldDirectly = useCallback(
+    async (fieldKey: string, value: string) => {
+      if (!state.sessionId || state.isLoading) return;
+
+      setState((prev) => ({ ...prev, isLoading: true }));
+
+      try {
+        const response = await api.fillFieldDirectly(state.sessionId, fieldKey, value);
+
+        // Update state with new preview and filled values
+        setState((prev) => ({
+          ...prev,
+          previewHtml: response.preview,
+          isLoading: false,
+          currentIndex: response.next_index ?? prev.currentIndex,
+          document: prev.document ? {
+            ...prev.document,
+            filledValues: response.filled_values || prev.document.filledValues,
+          } : null,
+          progress: response.progress_percentage || prev.progress,
+        }));
+
+        // Show success message if auto-filled
+        if (response.auto_filled && response.auto_filled.length > 0) {
+          console.log(`Auto-filled: ${response.auto_filled.join(', ')}`);
+        }
+      } catch (error) {
+        const errorMessage =
+          error instanceof ApiError ? error.message : 'Failed to fill field';
+        setState((prev) => ({
+          ...prev,
+          isLoading: false,
+          error: errorMessage,
+        }));
+        throw error; // Re-throw so component can handle it
+      }
+    },
+    [state.sessionId, state.isLoading]
+  );
+
   const handleEditField = useCallback(
     async (fieldKey: string, currentValue: string) => {
       if (!state.sessionId) return;
@@ -331,138 +372,221 @@ export default function Home() {
   const hasDocument = state.document !== null;
 
   return (
-    <main className="min-h-screen p-4 md:p-8">
-      <div className="max-w-7xl mx-auto space-y-6">
-        {/* Header */}
-        <div className="text-center space-y-2 mb-8">
-          <h1 className="text-4xl md:text-5xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-black">
-            Lexsy Document Automation
-          </h1>
-          <p className="text-gray-600 dark:text-gray-400 text-lg">
-            AI-powered legal document automation for startups
-          </p>
+    <main className="min-h-screen flex flex-col bg-white">
+      {/* Premium Header */}
+      <div className="border-b border-slate-200/50 bg-gradient-to-r from-white via-slate-50/30 to-white backdrop-blur-sm sticky top-0 z-40 transition-all duration-300">
+        <div className="max-w-7xl mx-auto px-4 md:px-8 py-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl md:text-3xl font-bold text-slate-900 transition-all duration-300">
+                Lexsy
+              </h1>
+              <p className="text-sm text-slate-600 mt-1 transition-all duration-300">
+                AI-powered legal document automation
+              </p>
+            </div>
+            {state.document && (
+              <div className="text-right animate-fadeIn">
+                <div className="text-sm font-medium text-slate-700 transition-all duration-300">
+                  {state.document.filename}
+                </div>
+                <div className="text-xs text-slate-500 mt-1 transition-all duration-300">
+                  {Object.keys(state.document.filledValues).length} / {state.document.placeholders.length} fields
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="max-w-full w-full flex-1 flex overflow-hidden">
+          {/* Error Display */}
+          {state.error && (
+            <div className="fixed top-20 left-4 right-4 max-w-md mx-auto z-50 animate-slideInRight">
+              <Card className="border-destructive/50 bg-destructive/10 backdrop-blur-sm">
+                <div className="p-4 flex items-center gap-3">
+                  <AlertCircle className="h-5 w-5 text-destructive" />
+                  <p className="text-sm text-destructive">{state.error}</p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setState((prev) => ({ ...prev, error: null }))}
+                    className="ml-auto"
+                  >
+                    Dismiss
+                  </Button>
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {/* Upload Zone - Only show when no document */}
+          {!hasDocument && (
+            <div className="px-4 md:px-8 py-12 flex items-center justify-center w-full animate-fadeIn">
+              <div className="max-w-2xl w-full">
+                <UploadZone
+                  onUpload={handleUpload}
+                  isLoading={state.isLoading}
+                  uploadedFile={uploadedFile}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Main Content - Fixed Sidebars with Scrollable Center */}
+          {hasDocument && state.document && (
+            <div className="flex-1 flex relative">
+              {/* LEFT: Progress Tracker - FIXED POSITION */}
+              <div className="hidden xl:block fixed left-0 top-[120px] bottom-[80px] w-72 z-30">
+                <div className="h-full border-r border-slate-200/50 bg-gradient-to-b from-white to-slate-50/30 transition-all duration-300 shadow-sm">
+                  <div className="h-full overflow-y-auto overflow-x-hidden scrollbar-hide">
+                    <ProgressTracker
+                      placeholders={state.document.placeholders}
+                      filledValues={state.document.filledValues}
+                      currentIndex={state.currentIndex}
+                      progress={state.progress}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* CENTER: Document Preview - SCROLLABLE CONTENT */}
+              <div className="flex-1 xl:ml-72 md:mr-[332px]">
+                <div className="h-full overflow-y-auto overflow-x-hidden scrollbar-hide">
+                  <div className="max-w-6xl mx-auto w-full p-4 sm:p-6 lg:p-8 transition-all duration-300">
+                    <DocumentPreview
+                      previewHtml={state.previewHtml}
+                      isLoading={state.isLoading && !state.previewHtml}
+                      onEditField={handleEditField}
+                      sessionId={state.sessionId}
+                      onFillField={handleFillFieldDirectly}
+                      currentIndex={state.currentIndex}
+                      placeholders={state.document?.placeholders || []}
+                      filledValues={state.document?.filledValues || {}}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* RIGHT: AI Assistant - FIXED POSITION */}
+              <div className="hidden md:block fixed right-10 top-[130px] bottom-[76px] w-80 z-60">
+                <div className="h-full bg-white border-l border-slate-200/50 shadow-lg transition-all duration-300">
+                  <ChatInterface
+                    messages={state.chatMessages}
+                    onSendMessage={handleSendMessage}
+                    isLoading={state.isLoading}
+                    disabled={state.isComplete}
+                    initialMessage={initialMessage}
+                    currentKey={state.document?.placeholders[state.currentIndex]?.id ?? state.document?.placeholders[state.currentIndex]?.key ?? null}
+                    currentValue={
+                      state.document?.placeholders[state.currentIndex]?.id
+                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].id!] ?? ''
+                        : state.document?.placeholders[state.currentIndex]?.key
+                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].key] ?? ''
+                        : ''
+                    }
+                  />
+                </div>
+              </div>
+
+              {/* MOBILE: Chat Fixed Window at Bottom (NO SCROLL) */}
+              {state.chatMessages.length > 0 && (
+                <div className="md:hidden fixed bottom-20 right-4 left-4 max-w-md h-[35vh] bg-white border border-slate-200/50 rounded-2xl flex flex-col shadow-2xl z-50 animate-slideInRight overflow-hidden min-h-0">
+                  <ChatInterface
+                    messages={state.chatMessages}
+                    onSendMessage={handleSendMessage}
+                    isLoading={state.isLoading}
+                    disabled={state.isComplete}
+                    initialMessage={initialMessage}
+                    currentKey={state.document?.placeholders[state.currentIndex]?.id ?? state.document?.placeholders[state.currentIndex]?.key ?? null}
+                    currentValue={
+                      state.document?.placeholders[state.currentIndex]?.id
+                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].id!] ?? ''
+                        : state.document?.placeholders[state.currentIndex]?.key
+                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].key] ?? ''
+                        : ''
+                    }
+                  />
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
-        {/* Error Display */}
-        {state.error && (
-          <Card className="border-destructive bg-destructive/10">
-            <div className="p-4 flex items-center gap-3">
-              <AlertCircle className="h-5 w-5 text-destructive" />
-              <p className="text-sm text-destructive">{state.error}</p>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setState((prev) => ({ ...prev, error: null }))}
-                className="ml-auto"
-              >
-                Dismiss
-              </Button>
+        {/* Action Buttons Footer - Below main content */}
+        {hasDocument && state.document && (
+          <div className="border-t border-slate-200/50 bg-gradient-to-r from-white to-slate-50/30 backdrop-blur-sm transition-all duration-300">
+            <div className="max-w-7xl mx-auto px-4 md:px-8 py-4 flex flex-col sm:flex-row gap-2 sm:gap-3">
+              {state.isComplete && state.downloadUrl ? (
+                <>
+                  <Button
+                    onClick={handleDownload}
+                    className="flex-1 order-1 sm:order-none bg-gradient-to-r from-primary to-primary/90 hover:shadow-lg transition-all duration-300"
+                    size="lg"
+                  >
+                    <Download className="h-4 w-4 mr-2" />
+                    Download Document
+                  </Button>
+                  <Button
+                    onClick={handleReset}
+                    variant="outline"
+                    className="flex-1 order-2 sm:order-none transition-all duration-300"
+                  >
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Start New
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    onClick={handleComplete}
+                    disabled={
+                      state.isLoading ||
+                      state.progress < 100 ||
+                      (state.document?.placeholders.length || 0) !==
+                        Object.keys(state.document?.filledValues || {}).length
+                    }
+                    className="flex-1 order-1 sm:order-none bg-gradient-to-r from-primary to-primary/90 hover:shadow-lg transition-all duration-300 disabled:opacity-50"
+                    size="lg"
+                  >
+                    <CheckCircle2 className="h-4 w-4 mr-2" />
+                    {state.isLoading ? 'Processing...' : 'Complete'}
+                  </Button>
+                  <Button
+                    onClick={handleReset}
+                    variant="outline"
+                    className="flex-1 order-2 sm:order-none transition-all duration-300"
+                    disabled={state.isLoading}
+                  >
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Reset
+                  </Button>
+                </>
+              )}
             </div>
-          </Card>
-        )}
-
-        {/* Upload Zone - Only show when no document */}
-        {!hasDocument && (
-          <div className="max-w-2xl mx-auto">
-            <UploadZone
-              onUpload={handleUpload}
-              isLoading={state.isLoading}
-              uploadedFile={uploadedFile}
-            />
           </div>
         )}
 
-        {/* Main Content - Show when document is uploaded */}
+        {/* Mobile Progress Bar - Shown only on small screens when document is open */}
         {hasDocument && state.document && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Left Column - Chat and Progress */}
-            <div className="lg:col-span-1 space-y-6">
-              <ProgressTracker
-                placeholders={state.document.placeholders}
-                filledValues={state.document.filledValues}
-                currentIndex={state.currentIndex}
-                progress={state.progress}
-              />
-
-              <div className="h-[600px]">
-                <ChatInterface
-                  messages={state.chatMessages}
-                  onSendMessage={handleSendMessage}
-                  isLoading={state.isLoading}
-                  disabled={state.isComplete}
-                  initialMessage={initialMessage}
-                  currentKey={state.document?.placeholders[state.currentIndex]?.id ?? state.document?.placeholders[state.currentIndex]?.key ?? null}
-                  currentValue={
-                    state.document?.placeholders[state.currentIndex]?.id
-                      ? state.document?.filledValues[state.document.placeholders[state.currentIndex].id!] ?? ''
-                      : state.document?.placeholders[state.currentIndex]?.key
-                      ? state.document?.filledValues[state.document.placeholders[state.currentIndex].key] ?? ''
-                      : ''
-                  }
+          <div className="xl:hidden border-t border-slate-200/50 bg-gradient-to-r from-white to-slate-50/30 backdrop-blur-sm px-4 py-3 transition-all duration-300">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-slate-900">Progress</span>
+                <span className="text-primary font-bold transition-all duration-500">{state.progress.toFixed(0)}%</span>
+              </div>
+              <div className="relative h-1.5 bg-slate-200/50 rounded-full overflow-hidden backdrop-blur-sm">
+                <div
+                  className="absolute inset-y-0 left-0 bg-gradient-to-r from-primary to-primary/70 rounded-full transition-all duration-500 ease-out shadow-sm"
+                  style={{ width: `${state.progress}%` }}
                 />
               </div>
-
-              {/* Action Buttons */}
-              <div className="flex flex-col gap-2">
-                {state.isComplete && state.downloadUrl ? (
-                  <>
-                    <Button
-                      onClick={handleDownload}
-                      className="w-full"
-                      size="lg"
-                    >
-                      <Download className="h-4 w-4 mr-2" />
-                      Download Document
-                    </Button>
-                    <Button
-                      onClick={handleReset}
-                      variant="outline"
-                      className="w-full"
-                    >
-                      <RefreshCw className="h-4 w-4 mr-2" />
-                      Start New Document
-                    </Button>
-                  </>
-                ) : (
-                  <>
-                    <Button
-                      onClick={handleComplete}
-                      disabled={
-                        state.isLoading ||
-                        state.progress < 100 ||
-                        (state.document?.placeholders.length || 0) !==
-                          Object.keys(state.document?.filledValues || {}).length
-                      }
-                      className="w-full"
-                      size="lg"
-                    >
-                      <CheckCircle2 className="h-4 w-4 mr-2" />
-                      {state.isLoading ? 'Processing...' : 'Complete Document'}
-                    </Button>
-                    <Button
-                      onClick={handleReset}
-                      variant="outline"
-                      className="w-full"
-                      disabled={state.isLoading}
-                    >
-                      <RefreshCw className="h-4 w-4 mr-2" />
-                      Reset Session
-                    </Button>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {/* Right Column - Document Preview */}
-            <div className="lg:col-span-2">
-              <div className="h-[600px]">
-                <DocumentPreview
-                  previewHtml={state.previewHtml}
-                  isLoading={state.isLoading && !state.previewHtml}
-                  onEditField={handleEditField}
-                  sessionId={state.sessionId}
-                  currentIndex={state.currentIndex}
-                />
+              <div className="flex gap-2 text-xs text-slate-600 transition-all duration-300">
+                <span>{Object.keys(state.document.filledValues).length} completed</span>
+                <span>•</span>
+                <span>{state.document.placeholders.length - Object.keys(state.document.filledValues).length} remaining</span>
               </div>
             </div>
           </div>
@@ -471,4 +595,5 @@ export default function Home() {
     </main>
   );
 }
+
 

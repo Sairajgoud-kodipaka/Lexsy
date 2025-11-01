@@ -296,42 +296,123 @@ I'll guide you through each field, validate your responses, and help ensure ever
                     'value': validation_result['processed_value']
                 }
                 
-                # Handle auto-fills for duplicate Company Name fields
-                # If we just filled body Company Name, also fill header Company Name
-                if current_placeholder['name'] == 'Company Name':
-                    # Find all other Company Name placeholders to auto-fill
-                    response['auto_fills'] = []
-                    for ph in placeholders:
-                        if (ph['name'] == 'Company Name' and 
-                            ph.get('id', ph['key']) != placeholder_id):
-                            response['auto_fills'].append({
-                                'key': ph.get('id', ph['key']),
-                                'value': validation_result['processed_value']
-                            })
-                    if response['auto_fills']:
-                        logger.info(f"Auto-filling {len(response['auto_fills'])} other Company Name fields")
+                # Handle auto-fills for duplicate fields with the same name
+                # If a field appears multiple times (e.g., "Disclosing Party Address" in Field 3 and Field 10),
+                # automatically fill all occurrences with the same value
+                current_name = current_placeholder['name']
+                current_normalized = self._normalize_field_name(current_name)
                 
-                # Check if there are more placeholders
-                if actual_index + 1 < len(placeholders):
-                    next_placeholder = placeholders[actual_index + 1]
+                response['auto_fills'] = []
+                auto_filled_count = 0
+                
+                for ph in placeholders:
+                    # Match by exact name (case-insensitive) and normalized name for better matching
+                    ph_name = ph.get('name', '')
+                    ph_normalized = self._normalize_field_name(ph_name)
+                    ph_id = ph.get('id', ph['key'])
+                    
+                    # Skip the current placeholder and already filled ones
+                    if ph_id == placeholder_id:
+                        continue
+                    
+                    # Match if exact name matches OR normalized name matches
+                    # This handles cases like "Disclosing Party Address" vs "disclosing party address"
+                    name_matches = (
+                        ph_name.lower() == current_name.lower() or 
+                        ph_normalized == current_normalized
+                    )
+                    
+                    if name_matches:
+                        # Check if this placeholder is already filled
+                        is_already_filled = (
+                            ph_id in filled_values or 
+                            ph['key'] in filled_values
+                        )
+                        
+                        if not is_already_filled:
+                            response['auto_fills'].append({
+                                'key': ph_id,
+                                'value': validation_result['processed_value'],
+                                'name': ph_name  # Include name for logging
+                            })
+                            auto_filled_count += 1
+                
+                if response['auto_fills']:
+                    auto_fill_names = [af.get('name', 'unknown') for af in response['auto_fills']]
+                    logger.info(
+                        f"Auto-filling {auto_filled_count} other occurrence(s) of '{current_name}': "
+                        f"{', '.join(auto_fill_names)}"
+                    )
+                
+                # Create a comprehensive set of all filled keys (including current and auto-fills)
+                all_filled_keys = set(filled_values.keys())
+                all_filled_keys.add(placeholder_id)  # Current placeholder
+                for auto_fill in response.get('auto_fills', []):
+                    all_filled_keys.add(auto_fill['key'])
+                    # Also add by key for compatibility
+                    auto_fill_ph = next((p for p in placeholders if p.get('id', p['key']) == auto_fill['key']), None)
+                    if auto_fill_ph:
+                        all_filled_keys.add(auto_fill_ph['key'])
+                
+                # Find the next unfilled placeholder (accounting for auto-fills)
+                # CRITICAL: Scan sequentially to find the first unfilled placeholder
+                # This handles edge cases where fields are out of order or auto-filled fields appear earlier
+                next_index = None
+                scanned_count = 0
+                for i, ph in enumerate(placeholders):
+                    scanned_count += 1
+                    ph_id = ph.get('id', ph['key'])
+                    ph_key = ph.get('key')
+                    
+                    # Check if this placeholder is already filled (including auto-fills)
+                    is_filled = (
+                        ph_id in all_filled_keys or 
+                        ph_key in all_filled_keys or
+                        ph_id in filled_values or 
+                        ph_key in filled_values
+                    )
+                    
+                    if not is_filled:
+                        next_index = i
+                        logger.debug(
+                            f"Next unfilled placeholder at index {i}: '{ph.get('name', 'Unknown')}' "
+                            f"(scanned {scanned_count}/{len(placeholders)} placeholders)"
+                        )
+                        break
+                
+                # Store next_index in response for app.py to use
+                response['next_index'] = next_index
+                
+                if next_index is not None:
+                    next_placeholder = placeholders[next_index]
                     response['message'] = self._generate_placeholder_question(
                         next_placeholder,
-                        actual_index + 1,
+                        next_index,
                         len(placeholders)
                     )
                 else:
                     # All placeholders filled
                     response['message'] = self._generate_completion_message(len(placeholders))
+                    logger.info(f"All {len(placeholders)} placeholders have been filled (including {auto_filled_count} auto-filled)")
                 
                 return response
             else:
-                # Invalid value - ask for correction with AI enhancement
+                # Invalid value - use validation error message directly
+                # Skip AI enhancement for number/month fields to avoid confusion
                 error_msg = validation_result['error_message']
+                placeholder_name = current_placeholder.get('name', '')
                 
-                # Try to make error message more helpful with AI
-                if self.provider == 'groq' and GROQ_AVAILABLE:
+                # Only use AI enhancement for non-number fields to avoid confusion
+                # Number/month fields already have clear error messages
+                is_number_field = (
+                    current_placeholder.get('type') == 'number' or
+                    'month' in placeholder_name.lower() or
+                    'term' in placeholder_name.lower()
+                )
+                
+                if not is_number_field and self.provider == 'groq' and GROQ_AVAILABLE:
                     try:
-                        ai_error_prompt = f"""User entered invalid input "{user_message}" for field "{current_placeholder.get('name')}".
+                        ai_error_prompt = f"""User entered invalid input "{user_message}" for field "{placeholder_name}".
                         
 The validation error is: {error_msg}
 
@@ -537,8 +618,45 @@ Return ONLY the question, no prefixes or extra text."""
             # Valid email - return it
             return {'valid': True, 'processed_value': value}
         
+        # Number validation for fields like "Term Months" - MUST come before date validation
+        # to prevent "12" from being treated as a date
+        # Check both type and name patterns to handle cases where type detection failed
+        is_month_number_field = (
+            placeholder_type == 'number' or 
+            ('month' in name and any(word in name for word in ['term', 'number', 'count', 'quantity', 'duration', 'period'])) or
+            ('term month' in name) or ('months' in name and 'date' not in name)
+        )
+        
+        if is_month_number_field:
+            # Remove commas for processing
+            cleaned_value = value.replace(',', '').strip()
+            
+            try:
+                number = float(cleaned_value)
+                
+                # Ensure it's a positive integer for months/terms
+                if number <= 0:
+                    return {
+                        'valid': False,
+                        'error_message': f"❌ The \"{placeholder.get('name', 'Term Months')}\" field should be a positive number of months (e.g., 6, 12, or 24)."
+                    }
+                
+                # Format as integer if it's a whole number
+                if number == int(number):
+                    value = str(int(number))
+                else:
+                    value = str(number)
+                
+                return {'valid': True, 'processed_value': value}
+                
+            except ValueError:
+                return {
+                    'valid': False,
+                    'error_message': f"❌ The \"{placeholder.get('name', 'Term Months')}\" field expects a number (e.g., 6, 12, or 24 months), not a date or text."
+                }
+        
         # Date validation and formatting
-        elif placeholder_type == 'date' or 'date' in name:
+        elif placeholder_type == 'date' or ('date' in name and 'month' not in name):
             # First validate MM/DD/YYYY format strictly
             date_formats = [
                 r'^(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/(\d{4})$',  # MM/DD/YYYY
@@ -680,8 +798,8 @@ Return ONLY the question, no prefixes or extra text."""
             
             return {'valid': True, 'processed_value': value}
         
-        # Number validation
-        elif 'number' in name or 'shares' in name or 'quantity' in name:
+        # Number validation (general case - for shares, quantities, etc.)
+        elif placeholder_type == 'number' or ('number' in name or 'shares' in name or 'quantity' in name):
             # Remove commas for processing
             cleaned_value = value.replace(',', '')
             
@@ -706,6 +824,31 @@ Return ONLY the question, no prefixes or extra text."""
             value = ' '.join(value.split())  # Normalize whitespace
             
             return {'valid': True, 'processed_value': value}
+    
+    def _normalize_field_name(self, name: str) -> str:
+        """
+        Normalize a field name for comparison (handles case, spaces, punctuation).
+        Used for matching duplicate fields that should be auto-filled.
+        
+        Args:
+            name (str): Field name to normalize
+            
+        Returns:
+            str: Normalized field name for comparison
+        """
+        if not name:
+            return ''
+        
+        # Convert to lowercase and remove extra whitespace
+        normalized = name.lower().strip()
+        
+        # Replace multiple spaces/underscores with single space
+        normalized = re.sub(r'[\s_]+', ' ', normalized)
+        
+        # Remove common punctuation but keep important separators
+        normalized = re.sub(r'[^\w\s]', '', normalized)
+        
+        return normalized
     
     def _generate_completion_message(self, total_placeholders: int) -> str:
         """

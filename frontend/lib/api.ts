@@ -163,6 +163,52 @@ export const api = {
 
     return handleResponse<{ status: string }>(response);
   },
+
+  async checkSessionHealth(sessionId: string): Promise<{
+    valid: boolean;
+    session_id?: string;
+    has_document?: boolean;
+    placeholders_count?: number;
+    filled_count?: number;
+    last_accessed?: string;
+    session_expired?: boolean;
+    error?: string;
+    message?: string;
+  }> {
+    const response = await fetch(
+      `${API_URL}/api/session/health?session_id=${sessionId}`,
+      {
+        method: 'GET',
+      }
+    );
+
+    return handleResponse(response);
+  },
+
+  async fillFieldDirectly(
+    sessionId: string,
+    fieldKey: string,
+    value: string
+  ): Promise<PreviewResponse & {
+    success: boolean;
+    message: string;
+    auto_filled?: string[];
+    next_index?: number | null;
+  }> {
+    const response = await fetch(`${API_URL}/api/fill`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        session_id: sessionId,
+        field_key: fieldKey,
+        value: value,
+      }),
+    });
+
+    return handleResponse(response);
+  },
 };
 
 export { ApiError };

@@ -91,6 +91,10 @@ ALLOWED_EXTENSIONS = {'docx', 'doc'}
 
 # In-memory session store (use Redis in production)
 session_store = {}
+_cleanup_counter = 0  # Track how many saves since last cleanup
+_CLEANUP_INTERVAL = 50  # Run cleanup every 50 saves (reduce overhead)
+_SESSION_TIMEOUT_HOURS = 168  # Sessions expire after 7 days of inactivity (was 24 hours)
+_SESSION_WARNING_HOURS = 6  # Warn if session is inactive for 6+ hours but don't expire yet
 
 
 def allowed_file(filename: str) -> bool:
@@ -109,6 +113,7 @@ def allowed_file(filename: str) -> bool:
 def get_session_data(session_id: str) -> Optional[Dict[str, Any]]:
     """
     Retrieve session data from storage.
+    Updates the last_accessed_at timestamp to prevent premature expiration.
     
     Args:
         session_id (str): Unique session identifier
@@ -116,44 +121,97 @@ def get_session_data(session_id: str) -> Optional[Dict[str, Any]]:
     Returns:
         Optional[Dict]: Session data if found, None otherwise
     """
-    return session_store.get(session_id)
+    session_data = session_store.get(session_id)
+    if session_data:
+        # Update last access time to prevent expiration of active sessions
+        session_data['last_accessed_at'] = datetime.now().isoformat()
+        logger.debug(f"Accessed session {session_id[:8]}...")
+    return session_data
 
 
 def save_session_data(session_id: str, data: Dict[str, Any]) -> None:
     """
     Save session data to storage.
+    Updates the last_accessed_at timestamp and runs cleanup periodically.
     
     Args:
         session_id (str): Unique session identifier
         data (Dict): Session data to save
     """
+    global _cleanup_counter
+    
+    # Ensure last_accessed_at is always updated
+    data['last_accessed_at'] = datetime.now().isoformat()
+    
+    # Ensure created_at exists (for new sessions)
+    if 'created_at' not in data:
+        data['created_at'] = datetime.now().isoformat()
+    
     session_store[session_id] = data
-    # Clean up old sessions (simple implementation - use Redis TTL in production)
-    cleanup_old_sessions()
+    logger.debug(f"Saved session {session_id[:8]}... (total sessions: {len(session_store)})")
+    
+    # Only run cleanup periodically to reduce overhead
+    _cleanup_counter += 1
+    if _cleanup_counter >= _CLEANUP_INTERVAL:
+        _cleanup_counter = 0
+        cleanup_old_sessions()
 
 
 def cleanup_old_sessions() -> None:
     """
     Remove expired sessions from storage.
-    Sessions older than 24 hours are removed.
+    Sessions inactive for more than SESSION_TIMEOUT_HOURS are removed.
+    Uses last_accessed_at if available, otherwise falls back to created_at.
     """
     current_time = datetime.now()
     expired_sessions = []
     
-    for sid, data in session_store.items():
-        if 'created_at' in data:
-            created_at = datetime.fromisoformat(data['created_at'])
-            if current_time - created_at > timedelta(hours=24):
+    for sid, data in list(session_store.items()):  # Use list() to avoid modification during iteration
+        try:
+            # Use last_accessed_at if available (more accurate for active sessions)
+            # Otherwise fall back to created_at
+            if 'last_accessed_at' in data:
+                last_access = datetime.fromisoformat(data['last_accessed_at'])
+                time_since_access = current_time - last_access
+            elif 'created_at' in data:
+                created_at = datetime.fromisoformat(data['created_at'])
+                time_since_access = current_time - created_at
+            else:
+                # Session without timestamps - should not happen, but log it
+                logger.warning(f"Session {sid[:8]}... has no timestamp, skipping cleanup")
+                continue
+            
+            # Only expire if inactive for more than the timeout period
+            if time_since_access > timedelta(hours=_SESSION_TIMEOUT_HOURS):
                 expired_sessions.append(sid)
+                logger.info(f"Marking session {sid[:8]}... for cleanup (inactive for {time_since_access})")
+        except (KeyError, ValueError) as e:
+            logger.error(f"Error processing session {sid[:8]}... for cleanup: {e}")
+            continue
     
+    # Clean up expired sessions
+    cleaned_count = 0
     for sid in expired_sessions:
-        # Clean up files
-        if sid in session_store and 'filepath' in session_store[sid]:
-            try:
-                os.remove(session_store[sid]['filepath'])
-            except:
-                pass
-        del session_store[sid]
+        try:
+            if sid in session_store:
+                # Clean up files
+                if 'filepath' in session_store[sid]:
+                    try:
+                        filepath = session_store[sid]['filepath']
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                            logger.debug(f"Removed file for expired session {sid[:8]}...")
+                    except OSError as e:
+                        logger.warning(f"Could not remove file for session {sid[:8]}...: {e}")
+                
+                del session_store[sid]
+                cleaned_count += 1
+                logger.info(f"Cleaned up expired session {sid[:8]}...")
+        except Exception as e:
+            logger.error(f"Error cleaning up session {sid[:8]}...: {e}")
+    
+    if cleaned_count > 0:
+        logger.info(f"Cleanup completed: removed {cleaned_count} expired session(s). Active sessions: {len(session_store)}")
 
 
 @app.route('/')
@@ -270,6 +328,7 @@ def upload_document():
         ai_context = ai_service.initialize_conversation(doc_content, placeholders)
         
         # Store session data
+        now = datetime.now().isoformat()
         session_data = {
             'session_id': session_id,
             'filepath': filepath,
@@ -280,7 +339,8 @@ def upload_document():
             'current_placeholder_index': 0,
             'ai_context': ai_context,
             'conversation_history': [],
-            'created_at': datetime.now().isoformat(),
+            'created_at': now,
+            'last_accessed_at': now,  # Track last access to prevent premature expiration
             'status': 'active'
         }
         
@@ -338,16 +398,25 @@ def chat():
             logger.warning("Chat request without session_id")
             return jsonify({
                 'error': 'No session found',
-                'message': 'Please upload a document first to start a conversation.'
+                'message': 'Please upload a document first to start a conversation.',
+                'session_expired': False,
+                'code': 'NO_SESSION'
             }), 400
         
-        # Retrieve session data
+        # Retrieve session data with better error handling
         session_data = get_session_data(session_id)
         if not session_data:
-            logger.warning(f"Chat request with invalid session_id: {session_id}")
+            # Try to get more info for debugging
+            active_sessions = list(session_store.keys())[:5] if session_store else []
+            logger.warning(
+                f"Chat request with invalid or expired session_id: {session_id[:8]}... "
+                f"Active sessions: {len(session_store)}. First 5: {[s[:8] + '...' for s in active_sessions]}"
+            )
             return jsonify({
                 'error': 'Session expired',
-                'message': 'Your session has expired. Please upload the document again.'
+                'message': 'Your session has expired. Please upload the document again.',
+                'session_expired': True,
+                'code': 'SESSION_EXPIRED'
             }), 400
         
         # Extract session information
@@ -378,16 +447,33 @@ def chat():
             placeholder_key = response['placeholder_key']
             filled_values[placeholder_key] = response['value']
             session_data['filled_values'] = filled_values
-            session_data['current_placeholder_index'] = current_index + 1
             
             logger.info(f"Filled placeholder {placeholder_key} with value: {response['value'][:50]}...")
             
-            # Handle auto-fills (e.g., duplicate Company Name in header)
+            # Handle auto-fills (e.g., duplicate fields like "Disclosing Party Address")
             if 'auto_fills' in response:
                 for auto_fill in response['auto_fills']:
                     filled_values[auto_fill['key']] = auto_fill['value']
                     session_data['filled_values'] = filled_values
-                    logger.info(f"Auto-filled {auto_fill['key']} with value: {auto_fill['value'][:50]}...")
+                    auto_fill_name = auto_fill.get('name', 'unknown field')
+                    logger.info(
+                        f"Auto-filled '{auto_fill_name}' (id: {auto_fill['key']}) "
+                        f"with value: {auto_fill['value'][:50]}..."
+                    )
+            
+            # Update current index using next_index from response (accounts for auto-fills)
+            # This ensures we skip auto-filled fields and move to the correct next unfilled field
+            if 'next_index' in response and response['next_index'] is not None:
+                session_data['current_placeholder_index'] = response['next_index']
+                logger.debug(f"Updated current_placeholder_index to {response['next_index']} based on response")
+            else:
+                # Fallback: If no next_index provided, use the next sequential index
+                # This should rarely happen, but provides safety
+                session_data['current_placeholder_index'] = current_index + 1
+                logger.warning(
+                    f"No next_index in response, using fallback: {current_index + 1}. "
+                    f"Total filled: {len(filled_values)}, Total placeholders: {len(placeholders)}"
+                )
         
         # Add AI response to history
         conversation_history.append({
@@ -402,13 +488,23 @@ def chat():
         # Check if all placeholders are filled
         all_filled = len(filled_values) == len(placeholders)
         
+        # Determine preview index: use next_index from response if available, otherwise use session index
+        # If next_index is None, all fields are filled
+        preview_index = None
+        if response.get('next_index') is not None:
+            preview_index = response['next_index']
+        elif not all_filled:
+            # Fallback to session index if not all filled
+            preview_index = session_data['current_placeholder_index']
+            if preview_index >= len(placeholders):
+                preview_index = None  # Safety check
+        
         # Generate fresh preview HTML to return with response
-        current_preview_index = session_data['current_placeholder_index']
         preview_html = doc_processor.generate_preview(
             content=session_data['content'],
             placeholders=placeholders,
             filled_values=filled_values,
-            current_index=current_preview_index if current_preview_index < len(placeholders) else None
+            current_index=preview_index
         )
         
         # Prepare response
@@ -420,7 +516,7 @@ def chat():
             'progress_percentage': round((len(filled_values) / len(placeholders) * 100), 1) if placeholders else 0,
             'all_filled': all_filled,
             'filled_values': filled_values,
-            'current_placeholder': placeholders[current_preview_index] if current_preview_index < len(placeholders) else None,
+            'current_placeholder': placeholders[preview_index] if preview_index is not None and preview_index < len(placeholders) else None,
             'preview': preview_html  # NEW: fresh preview with each response
         }
         
@@ -473,8 +569,16 @@ def edit_field():
         placeholders = session_data['placeholders']
         filled_values = session_data['filled_values']
         
-        # Find the placeholder
-        placeholder = next((p for p in placeholders if p['key'] == field_key), None)
+        # Find the placeholder by ID or key (support both)
+        placeholder = None
+        placeholder_id = None
+        
+        for p in placeholders:
+            if p.get('id') == field_key or p['key'] == field_key:
+                placeholder = p
+                placeholder_id = p.get('id', p['key'])
+                break
+        
         if not placeholder:
             return jsonify({
                 'error': 'Field not found',
@@ -490,9 +594,24 @@ def edit_field():
                 'message': validation_result['error_message']
             }), 400
         
-        # Update the value
-        filled_values[field_key] = validation_result['processed_value']
+        # Update the value (store by both ID and key for compatibility)
+        filled_values[placeholder_id] = validation_result['processed_value']
+        if placeholder_id != field_key:
+            filled_values[field_key] = validation_result['processed_value']
         session_data['filled_values'] = filled_values
+        
+        # Handle auto-fills for duplicate fields (same as in chat endpoint)
+        current_name = placeholder['name']
+        auto_filled = []
+        for ph in placeholders:
+            if (ph.get('id', ph['key']) != placeholder_id and 
+                ph['name'] == current_name):
+                ph_id = ph.get('id', ph['key'])
+                filled_values[ph_id] = validation_result['processed_value']
+                auto_filled.append(ph_id)
+        
+        if auto_filled:
+            logger.info(f"Auto-filled {len(auto_filled)} duplicate fields when editing '{current_name}'")
         
         # Update current index to this field if needed (allow editing any field)
         field_index = next((i for i, p in enumerate(placeholders) if p['key'] == field_key), None)
@@ -531,6 +650,174 @@ def edit_field():
         return jsonify({
             'error': 'Edit processing error',
             'message': 'An error occurred while updating the field. Please try again.'
+        }), 500
+
+
+@app.route('/api/session/health', methods=['GET'])
+def session_health():
+    """
+    Check if a session is still valid and active.
+    
+    Returns:
+        JSON response with session status
+    """
+    try:
+        session_id = request.args.get('session_id')
+        
+        if not session_id:
+            return jsonify({
+                'valid': False,
+                'error': 'No session ID provided',
+                'message': 'Session ID is required.'
+            }), 400
+        
+        session_data = get_session_data(session_id)
+        
+        if session_data:
+            return jsonify({
+                'valid': True,
+                'session_id': session_id,
+                'has_document': 'content' in session_data,
+                'placeholders_count': len(session_data.get('placeholders', [])),
+                'filled_count': len(session_data.get('filled_values', {})),
+                'last_accessed': session_data.get('last_accessed_at')
+            }), 200
+        else:
+            return jsonify({
+                'valid': False,
+                'error': 'Session not found',
+                'message': 'Session expired or invalid.',
+                'session_expired': True
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"Error checking session health: {str(e)}")
+        return jsonify({
+            'valid': False,
+            'error': 'Health check failed',
+            'message': 'An error occurred while checking session status.'
+        }), 500
+
+
+@app.route('/api/fill', methods=['POST'])
+def fill_field_directly():
+    """
+    Fill a field directly (for inline editing in document preview).
+    Works for both filled and unfilled fields.
+    
+    Returns:
+        JSON response with updated preview
+    """
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        field_key = data.get('field_key')  # Can be ID or key
+        value = data.get('value', '').strip()
+        
+        if not session_id:
+            return jsonify({
+                'error': 'No session found',
+                'message': 'Session ID is required.'
+            }), 400
+        
+        if not field_key:
+            return jsonify({
+                'error': 'No field specified',
+                'message': 'Field identifier is required.'
+            }), 400
+        
+        # Retrieve session data
+        session_data = get_session_data(session_id)
+        if not session_data:
+            return jsonify({
+                'error': 'Session expired',
+                'message': 'Your session has expired. Please upload the document again.',
+                'session_expired': True
+            }), 400
+        
+        placeholders = session_data['placeholders']
+        filled_values = session_data['filled_values']
+        
+        # Find placeholder by ID or key
+        placeholder = None
+        placeholder_id = None
+        
+        for p in placeholders:
+            if p.get('id') == field_key or p['key'] == field_key:
+                placeholder = p
+                placeholder_id = p.get('id', p['key'])
+                break
+        
+        if not placeholder:
+            return jsonify({
+                'error': 'Field not found',
+                'message': 'The specified field does not exist.'
+            }), 400
+        
+        # Validate value
+        validation_result = ai_service._validate_placeholder_value(value, placeholder)
+        
+        if not validation_result['valid']:
+            return jsonify({
+                'error': 'Invalid value',
+                'message': validation_result['error_message']
+            }), 400
+        
+        # Update value
+        processed_value = validation_result['processed_value']
+        filled_values[placeholder_id] = processed_value
+        
+        # Auto-fill duplicate fields
+        current_name = placeholder['name']
+        auto_filled = []
+        for ph in placeholders:
+            if (ph.get('id', ph['key']) != placeholder_id and 
+                ph['name'] == current_name):
+                ph_id = ph.get('id', ph['key'])
+                if ph_id not in filled_values:
+                    filled_values[ph_id] = processed_value
+                    auto_filled.append(ph['name'])
+        
+        session_data['filled_values'] = filled_values
+        save_session_data(session_id, session_data)
+        
+        # Calculate next unfilled index
+        all_filled_keys = set(filled_values.keys())
+        next_index = None
+        for i, ph in enumerate(placeholders):
+            ph_id = ph.get('id', ph['key'])
+            if ph_id not in all_filled_keys and ph['key'] not in all_filled_keys:
+                next_index = i
+                break
+        
+        # Generate preview
+        preview_html = doc_processor.generate_preview(
+            content=session_data['content'],
+            placeholders=placeholders,
+            filled_values=filled_values,
+            current_index=next_index
+        )
+        
+        response_data = {
+            'success': True,
+            'message': f'Field "{current_name}" filled successfully.' + 
+                      (f' Auto-filled {len(auto_filled)} duplicate field(s).' if auto_filled else ''),
+            'preview': preview_html,
+            'filled_count': len(filled_values),
+            'total_count': len(placeholders),
+            'progress_percentage': round((len(filled_values) / len(placeholders) * 100), 1) if placeholders else 0,
+            'filled_values': filled_values,
+            'next_index': next_index,
+            'auto_filled': auto_filled
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        logger.error(f"Error filling field directly: {str(e)}")
+        return jsonify({
+            'error': 'Fill processing error',
+            'message': 'An error occurred while filling the field. Please try again.'
         }), 500
 
 

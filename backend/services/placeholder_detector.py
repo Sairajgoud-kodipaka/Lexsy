@@ -262,7 +262,8 @@ class PlaceholderDetector:
         Key logic:
         - For identical patterns like $[___], check CONTEXT to determine if they're different fields
         - Example: $[___] with "purchase amount" context vs $[___] with "valuation cap" context
-        - Only merge truly identical fields (same name + same context + close location)
+        - CRITICAL: NEVER merge placeholders in different locations - always keep them separate
+        - Only merge truly identical fields (same name + same context + SAME location)
         
         Args:
             all_placeholders: All detected placeholders (may have duplicates)
@@ -273,49 +274,78 @@ class PlaceholderDetector:
         if not all_placeholders:
             return []
         
-        # Group by context-aware signature
+        # Group by context-aware signature + location to ensure different locations stay separate
         groups = {}
         
         for p in all_placeholders:
             name_lower = p['name'].lower().strip()
             context_lower = p.get('context', '').lower()
             original = p['original']
+            location = p['location']
+            location_type = p['location_type']
             
             # Special handling for identical patterns (like $[___] or [___])
-            if original in ['$[_____________]', '$[___________]', '$[_____]', '[_____________]']:
-                # Use CONTEXT to differentiate
-                if 'purchase amount' in context_lower or 'payment by' in context_lower or 'exchange for' in context_lower:
-                    signature = 'purchase_amount'
-                elif 'post-money valuation cap' in context_lower or 'valuation cap' in context_lower:
-                    signature = 'valuation_cap'
-                elif 'post money' in context_lower:
-                    signature = 'valuation_cap'
+            # CRITICAL: Include location in signature to prevent merging across different locations
+            if original.startswith('$[') or (original.startswith('[') and len(original) > 10):
+                # Check if it's a blank dollar amount pattern (with underscores)
+                is_blank_dollar = original.startswith('$[') and ('_' in original or len(original) > 8)
+                if is_blank_dollar:
+                    # Use CONTEXT to differentiate, but ALWAYS include location
+                    if 'purchase amount' in context_lower or 'payment by' in context_lower or 'exchange for' in context_lower:
+                        signature = f'purchase_amount_{location_type}_{location}'
+                    elif 'post-money valuation cap' in context_lower or 'valuation cap' in context_lower:
+                        signature = f'valuation_cap_{location_type}_{location}'
+                    elif 'post money' in context_lower:
+                        signature = f'valuation_cap_{location_type}_{location}'
+                    else:
+                        # Fallback: use location to keep them separate
+                        signature = f"amount_field_{location_type}_{location}"
                 else:
-                    # Fallback: use location to keep them separate
-                    signature = f"amount_field_{p['location']}"
+                    # Has actual text inside - use name + location
+                    signature = f"{name_lower}_{location_type}_{location}"
             else:
-                # For named placeholders, use normalized key
-                signature = p.get('normalized_key', name_lower)
+                # For named placeholders, include location to prevent cross-location merging
+                normalized_key = p.get('normalized_key', name_lower)
+                signature = f"{normalized_key}_{location_type}_{location}"
             
             if signature not in groups:
                 groups[signature] = []
             groups[signature].append(p)
         
-        # For each group, keep the first occurrence
+        # For each group, handle duplicates
         unique = []
         for signature, group in groups.items():
             if len(group) == 1:
                 # Single occurrence - keep it
                 unique.append(group[0])
             else:
-                # Multiple occurrences - sort by location and keep first
-                group.sort(key=lambda x: (
-                    x['location_type'],
-                    x['location'] if isinstance(x['location'], int) else str(x['location']),
-                    x['position'][0]
-                ))
-                unique.append(group[0])
-                logger.info(f"Deduplicated {len(group)} occurrences of '{group[0]['name']}' (signature: {signature})")
+                # Multiple occurrences with same signature - these are true duplicates
+                # Sort by position within the same location and keep only the first
+                group.sort(key=lambda x: x['position'][0])
+                
+                # Only deduplicate if they're in the EXACT same location and position is very close
+                # (within 10 characters suggests it's the same placeholder detected twice)
+                filtered_group = []
+                seen_positions = set()
+                
+                for p in group:
+                    pos_key = (p['position'][0], p['position'][1])
+                    # Only consider it a duplicate if position is very close (within 10 chars)
+                    is_duplicate = False
+                    for seen_pos in seen_positions:
+                        if abs(pos_key[0] - seen_pos[0]) < 10:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        filtered_group.append(p)
+                        seen_positions.add(pos_key)
+                
+                # Keep all non-duplicate occurrences
+                unique.extend(filtered_group)
+                
+                if len(group) > len(filtered_group):
+                    logger.info(f"Deduplicated {len(group) - len(filtered_group)} duplicate occurrences of '{group[0]['name']}' (signature: {signature})")
         
         logger.info(f"Smart deduplication: {len(all_placeholders)} total → {len(unique)} unique")
         return unique
@@ -597,7 +627,10 @@ class PlaceholderDetector:
         # to avoid false matches (e.g., "State of Incorporation" should be 'address', not 'company')
         
         # Special cases for compound phrases
-        if 'state of incorporation' in name_lower:
+        # IMPORTANT: Check address fields FIRST to override 'party' matching in person type
+        if 'address' in name_lower:
+            return 'address'
+        elif 'state of incorporation' in name_lower:
             return 'address'
         elif 'governing law' in name_lower or 'governing law jurisdiction' in name_lower:
             return 'address'
@@ -613,6 +646,9 @@ class PlaceholderDetector:
             return 'person'
         elif 'company name' in name_lower:
             return 'company'
+        # Special handling for "Term Months", "Number of Months" etc. - these are numbers, not dates
+        elif ('term' in name_lower and 'month' in name_lower) or ('number of month' in name_lower) or ('month' in name_lower and any(word in name_lower for word in ['term', 'number', 'count', 'quantity', 'duration', 'period'])):
+            return 'number'
         
         # Check each type's indicators (after special cases)
         for type_name, indicators in self.type_indicators.items():
