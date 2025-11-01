@@ -68,6 +68,14 @@ logs/
 *.cert
 secrets/
 
+# Firebase Service Account (CRITICAL - NEVER COMMIT)
+backend/firebase-service-account.json
+backend/*-firebase-adminsdk-*.json
+backend/firebase-adminsdk-*.json
+firebase-service-account.json
+*-firebase-adminsdk-*.json
+firebase-adminsdk-*.json
+
 # Testing
 .coverage
 htmlcov/

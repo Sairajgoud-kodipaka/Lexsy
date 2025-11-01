@@ -8,7 +8,7 @@ import { DocumentPreview } from '@/components/document-preview';
 import { ProgressTracker } from '@/components/progress-tracker';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { api, ApiError } from '@/lib/api';
+import { api, ApiError, setAuthToken, streamGroq } from '@/lib/api';
 import type {
   AppState,
   ChatMessage,
@@ -19,8 +19,16 @@ import type {
   CompleteResponse,
 } from '@/lib/types';
 import { Progress } from '@/components/ui/progress';
+import { useAuth } from '@/hooks/useAuth';
+import { LoginButton } from '@/components/auth/login-button';
+import { ThemeToggle } from '@/components/ui/theme-toggle';
 
 export default function Home() {
+  const { user, loading: authLoading, token } = useAuth();
+  useEffect(() => {
+    setAuthToken(token || null);
+  }, [token]);
+
   const [state, setState] = useState<AppState>({
     sessionId: null,
     document: null,
@@ -36,6 +44,11 @@ export default function Home() {
 
   const [initialMessage, setInitialMessage] = useState<string>('');
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+
+  // Assistant tabs: 'doc' (document assistant) or 'ai' (generic Groq)
+  const [assistantTab, setAssistantTab] = useState<'doc' | 'ai'>('doc');
+  const [aiMessages, setAiMessages] = useState<ChatMessage[]>([]);
+  const [aiLoading, setAiLoading] = useState<boolean>(false);
 
   const handleUpload = useCallback(async (file: File) => {
     setUploadedFile(file);
@@ -153,6 +166,49 @@ export default function Home() {
       }
     },
     [state.sessionId, state.isLoading]
+  );
+
+  // Generic AI (Groq) chat handler with streaming
+  const handleSendAIMessage = useCallback(
+    async (message: string) => {
+      if (aiLoading) return;
+
+      const userMessage: ChatMessage = {
+        id: `ai-user-${Date.now()}`,
+        role: 'user',
+        content: message,
+        timestamp: new Date(),
+      };
+
+      const assistantId = `ai-assistant-${Date.now()}`;
+      const assistantMessage: ChatMessage = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        timestamp: new Date(),
+      };
+
+      setAiMessages((prev) => [...prev, userMessage, assistantMessage]);
+      setAiLoading(true);
+
+      try {
+        let accumulated = '';
+        await streamGroq(message, (chunk) => {
+          accumulated += chunk;
+          setAiMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, content: accumulated } : m))
+          );
+        });
+      } catch (e) {
+        const errText = e instanceof Error ? e.message : 'AI error';
+        setAiMessages((prev) =>
+          prev.map((m) => (m.id === assistantId ? { ...m, content: `Error: ${errText}` } : m))
+        );
+      } finally {
+        setAiLoading(false);
+      }
+    },
+    [aiLoading]
   );
 
   const loadPreview = useCallback(async (sessionId: string) => {
@@ -372,25 +428,29 @@ export default function Home() {
   const hasDocument = state.document !== null;
 
   return (
-    <main className="min-h-screen flex flex-col bg-white">
+    <main className="min-h-screen flex flex-col bg-background">
       {/* Premium Header */}
-      <div className="border-b border-slate-200/50 bg-gradient-to-r from-white via-slate-50/30 to-white backdrop-blur-sm sticky top-0 z-40 transition-all duration-300">
-        <div className="max-w-7xl mx-auto px-4 md:px-8 py-6">
-          <div className="flex items-center justify-between">
+      <div className="border-b border-border/50 bg-background/80 backdrop-blur-sm sticky top-0 z-40 transition-all duration-300">
+        <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-8 py-4 md:py-5">
+          <div className="flex items-center justify-between gap-3">
             <div>
-              <h1 className="text-2xl md:text-3xl font-bold text-slate-900 transition-all duration-300">
+              <h1 className="text-xl sm:text-2xl md:text-3xl font-bold text-foreground transition-all duration-300">
                 Lexsy
               </h1>
-              <p className="text-sm text-slate-600 mt-1 transition-all duration-300">
+              <p className="text-xs sm:text-sm text-muted-foreground mt-1 transition-all duration-300">
                 AI-powered legal document automation
               </p>
             </div>
+            <div className="flex items-center gap-2 sm:gap-3">
+              <ThemeToggle />
+              <LoginButton />
+            </div>
             {state.document && (
-              <div className="text-right animate-fadeIn">
-                <div className="text-sm font-medium text-slate-700 transition-all duration-300">
+              <div className="hidden md:block text-right animate-fadeIn">
+                <div className="text-sm font-medium text-foreground transition-all duration-300">
                   {state.document.filename}
                 </div>
-                <div className="text-xs text-slate-500 mt-1 transition-all duration-300">
+                <div className="text-xs text-muted-foreground mt-1 transition-all duration-300">
                   {Object.keys(state.document.filledValues).length} / {state.document.placeholders.length} fields
                 </div>
               </div>
@@ -422,15 +482,37 @@ export default function Home() {
             </div>
           )}
 
-          {/* Upload Zone - Only show when no document */}
+          {/* Auth-gated Hero or Upload */}
           {!hasDocument && (
             <div className="px-4 md:px-8 py-12 flex items-center justify-center w-full animate-fadeIn">
-              <div className="max-w-2xl w-full">
-                <UploadZone
-                  onUpload={handleUpload}
-                  isLoading={state.isLoading}
-                  uploadedFile={uploadedFile}
-                />
+              <div className="max-w-4xl w-full">
+                {!user ? (
+                  <div className="text-center space-y-8">
+                    <div className="space-y-4">
+                      <h2 className="text-3xl md:text-4xl font-bold text-foreground">Fill legal docs in minutes</h2>
+                      <p className="text-muted-foreground max-w-2xl mx-auto">
+                        Sign in to start a guided, AI-assisted workflow for uploading a .docx template,
+                        answering a few questions, and downloading a clean, completed contract.
+                      </p>
+                    </div>
+                    <div className="flex items-center justify-center">
+                      <LoginButton />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
+                      <Card className="p-4"><p className="text-sm text-slate-700">Smart placeholder detection</p></Card>
+                      <Card className="p-4"><p className="text-sm text-slate-700">Inline preview & edits</p></Card>
+                      <Card className="p-4"><p className="text-sm text-slate-700">Download ready .docx</p></Card>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="max-w-2xl w-full">
+                    <UploadZone
+                      onUpload={handleUpload}
+                      isLoading={state.isLoading}
+                      uploadedFile={uploadedFile}
+                    />
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -438,9 +520,18 @@ export default function Home() {
           {/* Main Content - Fixed Sidebars with Scrollable Center */}
           {hasDocument && state.document && (
             <div className="flex-1 flex relative">
+              {/* Smooth loading overlay during processing */}
+              {state.isLoading && (
+                <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-background/40 backdrop-blur-sm animate-fadeIn">
+                  <div className="flex items-center gap-2 text-sm text-foreground bg-card/80 border border-border px-3 py-2 rounded-full shadow-sm">
+                    <span className="h-2 w-2 rounded-full bg-primary animate-pulse"></span>
+                    Processing...
+                  </div>
+                </div>
+              )}
               {/* LEFT: Progress Tracker - FIXED POSITION */}
               <div className="hidden xl:block fixed left-0 top-[120px] bottom-[80px] w-72 z-30">
-                <div className="h-full border-r border-slate-200/50 bg-gradient-to-b from-white to-slate-50/30 transition-all duration-300 shadow-sm">
+                <div className="h-full border-r border-border/50 bg-card transition-all duration-300 shadow-sm">
                   <div className="h-full overflow-y-auto overflow-x-hidden scrollbar-hide">
                     <ProgressTracker
                       placeholders={state.document.placeholders}
@@ -453,7 +544,7 @@ export default function Home() {
               </div>
 
               {/* CENTER: Document Preview - SCROLLABLE CONTENT */}
-              <div className="flex-1 xl:ml-72 md:mr-[332px]">
+              <div className="flex-1 xl:ml-72 md:mr-[360px]">
                 <div className="h-full overflow-y-auto overflow-x-hidden scrollbar-hide">
                   <div className="max-w-6xl mx-auto w-full p-4 sm:p-6 lg:p-8 transition-all duration-300">
                     <DocumentPreview
@@ -470,45 +561,79 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* RIGHT: AI Assistant - FIXED POSITION */}
-              <div className="hidden md:block fixed right-10 top-[130px] bottom-[76px] w-80 z-60">
-                <div className="h-full bg-white border-l border-slate-200/50 shadow-lg transition-all duration-300">
-                  <ChatInterface
-                    messages={state.chatMessages}
-                    onSendMessage={handleSendMessage}
-                    isLoading={state.isLoading}
-                    disabled={state.isComplete}
-                    initialMessage={initialMessage}
-                    currentKey={state.document?.placeholders[state.currentIndex]?.id ?? state.document?.placeholders[state.currentIndex]?.key ?? null}
-                    currentValue={
-                      state.document?.placeholders[state.currentIndex]?.id
-                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].id!] ?? ''
-                        : state.document?.placeholders[state.currentIndex]?.key
-                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].key] ?? ''
-                        : ''
-                    }
-                  />
+              {/* RIGHT: Assistant panel with tabs - FIXED POSITION */}
+              <div className="hidden md:block fixed right-0 top-[130px] bottom-[76px] w-[340px] z-60">
+                <div className="h-full bg-card border-l border-border/50 shadow-lg transition-all duration-300">
+                  <div className="border-b border-border/60 p-2 flex gap-1">
+                    <button
+                      className={`flex-1 text-xs py-1.5 rounded-md ${assistantTab === 'doc' ? 'bg-primary/10 text-primary font-semibold' : 'hover:bg-muted'}`}
+                      onClick={() => setAssistantTab('doc')}
+                    >
+                      Doc Assistant
+                    </button>
+                    <button
+                      className={`flex-1 text-xs py-1.5 rounded-md ${assistantTab === 'ai' ? 'bg-primary/10 text-primary font-semibold' : 'hover:bg-muted'}`}
+                      onClick={() => setAssistantTab('ai')}
+                    >
+                      AI
+                    </button>
+                  </div>
+                  {assistantTab === 'doc' ? (
+                    <ChatInterface
+                      messages={state.chatMessages}
+                      onSendMessage={handleSendMessage}
+                      isLoading={state.isLoading}
+                      disabled={state.isComplete}
+                      initialMessage={initialMessage}
+                      currentKey={state.document?.placeholders[state.currentIndex]?.id ?? state.document?.placeholders[state.currentIndex]?.key ?? null}
+                      currentValue={
+                        state.document?.placeholders[state.currentIndex]?.id
+                          ? state.document?.filledValues[state.document.placeholders[state.currentIndex].id!] ?? ''
+                          : state.document?.placeholders[state.currentIndex]?.key
+                          ? state.document?.filledValues[state.document.placeholders[state.currentIndex].key] ?? ''
+                          : ''
+                      }
+                    />
+                  ) : (
+                    <ChatInterface
+                      messages={aiMessages}
+                      onSendMessage={handleSendAIMessage}
+                      isLoading={aiLoading}
+                      disabled={false}
+                      initialMessage={'Ask me anything.'}
+                    />
+                  )}
                 </div>
               </div>
 
               {/* MOBILE: Chat Fixed Window at Bottom (NO SCROLL) */}
-              {state.chatMessages.length > 0 && (
-                <div className="md:hidden fixed bottom-20 right-4 left-4 max-w-md h-[35vh] bg-white border border-slate-200/50 rounded-2xl flex flex-col shadow-2xl z-50 animate-slideInRight overflow-hidden min-h-0">
-                  <ChatInterface
-                    messages={state.chatMessages}
-                    onSendMessage={handleSendMessage}
-                    isLoading={state.isLoading}
-                    disabled={state.isComplete}
-                    initialMessage={initialMessage}
-                    currentKey={state.document?.placeholders[state.currentIndex]?.id ?? state.document?.placeholders[state.currentIndex]?.key ?? null}
-                    currentValue={
-                      state.document?.placeholders[state.currentIndex]?.id
-                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].id!] ?? ''
-                        : state.document?.placeholders[state.currentIndex]?.key
-                        ? state.document?.filledValues[state.document.placeholders[state.currentIndex].key] ?? ''
-                        : ''
-                    }
-                  />
+              {(assistantTab === 'doc' ? state.chatMessages.length > 0 : aiMessages.length > 0) && (
+                <div className="md:hidden fixed bottom-20 right-4 left-4 max-w-md h-[35vh] bg-card border border-border/50 rounded-2xl flex flex-col shadow-2xl z-50 animate-slideInRight overflow-hidden min-h-0">
+                  {assistantTab === 'doc' ? (
+                    <ChatInterface
+                      messages={state.chatMessages}
+                      onSendMessage={handleSendMessage}
+                      isLoading={state.isLoading}
+                      disabled={state.isComplete}
+                      initialMessage={initialMessage}
+                      currentKey={state.document?.placeholders[state.currentIndex]?.id ?? state.document?.placeholders[state.currentIndex]?.key ?? null}
+                      currentValue={
+                        state.document?.placeholders[state.currentIndex]?.id
+                          ? state.document?.filledValues[state.document.placeholders[state.currentIndex].id!] ?? ''
+                          : state.document?.placeholders[state.currentIndex]?.key
+                          ? state.document?.filledValues[state.document.placeholders[state.currentIndex].key] ?? ''
+                          : ''
+                      }
+                    />
+                  ) : (
+                    <ChatInterface
+                      messages={aiMessages}
+                      onSendMessage={handleSendAIMessage}
+                      isLoading={aiLoading}
+                      disabled={false}
+                      initialMessage={'Ask me anything.'}
+                    />
+                  )}
                 </div>
               )}
             </div>
@@ -517,13 +642,13 @@ export default function Home() {
 
         {/* Action Buttons Footer - Below main content */}
         {hasDocument && state.document && (
-          <div className="border-t border-slate-200/50 bg-gradient-to-r from-white to-slate-50/30 backdrop-blur-sm transition-all duration-300">
+          <div className="border-t border-border/50 bg-background/80 backdrop-blur-sm transition-all duration-300">
             <div className="max-w-7xl mx-auto px-4 md:px-8 py-4 flex flex-col sm:flex-row gap-2 sm:gap-3">
               {state.isComplete && state.downloadUrl ? (
                 <>
                   <Button
                     onClick={handleDownload}
-                    className="flex-1 order-1 sm:order-none bg-gradient-to-r from-primary to-primary/90 hover:shadow-lg transition-all duration-300"
+                    className="flex-1 order-1 sm:order-none hover:shadow-lg transition-all duration-300"
                     size="lg"
                   >
                     <Download className="h-4 w-4 mr-2" />
@@ -548,7 +673,7 @@ export default function Home() {
                       (state.document?.placeholders.length || 0) !==
                         Object.keys(state.document?.filledValues || {}).length
                     }
-                    className="flex-1 order-1 sm:order-none bg-gradient-to-r from-primary to-primary/90 hover:shadow-lg transition-all duration-300 disabled:opacity-50"
+                    className="flex-1 order-1 sm:order-none hover:shadow-lg transition-all duration-300 disabled:opacity-50"
                     size="lg"
                   >
                     <CheckCircle2 className="h-4 w-4 mr-2" />
@@ -571,19 +696,19 @@ export default function Home() {
 
         {/* Mobile Progress Bar - Shown only on small screens when document is open */}
         {hasDocument && state.document && (
-          <div className="xl:hidden border-t border-slate-200/50 bg-gradient-to-r from-white to-slate-50/30 backdrop-blur-sm px-4 py-3 transition-all duration-300">
+          <div className="xl:hidden border-t border-border/50 bg-background/80 backdrop-blur-sm px-4 py-3 transition-all duration-300">
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-900">Progress</span>
+                <span className="font-semibold text-foreground">Progress</span>
                 <span className="text-primary font-bold transition-all duration-500">{state.progress.toFixed(0)}%</span>
               </div>
-              <div className="relative h-1.5 bg-slate-200/50 rounded-full overflow-hidden backdrop-blur-sm">
+              <div className="relative h-1.5 bg-muted rounded-full overflow-hidden backdrop-blur-sm">
                 <div
-                  className="absolute inset-y-0 left-0 bg-gradient-to-r from-primary to-primary/70 rounded-full transition-all duration-500 ease-out shadow-sm"
+                  className="absolute inset-y-0 left-0 bg-primary rounded-full transition-all duration-500 ease-out shadow-sm"
                   style={{ width: `${state.progress}%` }}
                 />
               </div>
-              <div className="flex gap-2 text-xs text-slate-600 transition-all duration-300">
+              <div className="flex gap-2 text-xs text-muted-foreground transition-all duration-300">
                 <span>{Object.keys(state.document.filledValues).length} completed</span>
                 <span>•</span>
                 <span>{state.document.placeholders.length - Object.keys(state.document.filledValues).length} remaining</span>

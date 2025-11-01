@@ -74,7 +74,7 @@ export function DocumentPreview({
         return;
       }
 
-      // Double-click or single click to edit
+      // Single click to edit
       const fieldKey = el.getAttribute('data-ph') || el.getAttribute('data-key') || '';
       const currentValue = el.textContent?.trim() || '';
       const placeholder = el.getAttribute('data-name') || el.getAttribute('title') || 'Enter value';
@@ -83,36 +83,54 @@ export function DocumentPreview({
       if (onFillField) {
         e.stopPropagation(); // Prevent event bubbling
         
-        // Calculate position immediately - getBoundingClientRect gives viewport-relative coords
-        // For position:fixed, we use viewport coordinates directly (no scroll offsets needed)
+        // Calculate position immediately
         const rect = el.getBoundingClientRect();
+        const containerRect = previewRef.current?.getBoundingClientRect();
         
-        // Scroll field into view smoothly
+        if (!containerRect) return;
+        
+        // Calculate position relative to the document preview container
+        const relativeLeft = rect.left - containerRect.left;
+        const relativeTop = rect.top - containerRect.top;
+        
+        // Ensure editor stays within container boundaries
+        const editorWidth = Math.max(rect.width, 280);
+        const editorHeight = 120; // Approximate editor height
+        
+        // Constrain horizontal position
+        let constrainedLeft = Math.max(10, relativeLeft);
+        constrainedLeft = Math.min(constrainedLeft, containerRect.width - editorWidth - 10);
+        
+        // Constrain vertical position (prefer above, but below if no space)
+        let constrainedTop = relativeTop - 80;
+        if (constrainedTop < 10) {
+          constrainedTop = relativeTop + rect.height + 10;
+        }
+        if (constrainedTop + editorHeight > containerRect.height - 10) {
+          constrainedTop = containerRect.height - editorHeight - 10;
+        }
+        
+        const position = {
+          left: constrainedLeft,
+          top: constrainedTop,
+          minWidth: editorWidth,
+          // Store original coords for reference
+          rectLeft: relativeLeft,
+          rectTop: relativeTop,
+        };
+        
+        // Show editor immediately
+        setEditorPosition(position);
+        setEditingField({
+          key: fieldKey,
+          value: currentValue,
+          element: el,
+          placeholder: placeholder
+        });
+        setEditValue(currentValue);
+        
+        // Optionally scroll into view (but don't wait for it)
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        
-        // Small delay to ensure scroll completes, then show editor
-        setTimeout(() => {
-          const updatedRect = el.getBoundingClientRect();
-          
-          // Position editor near the clicked element (above it)
-          const position = {
-            left: updatedRect.left,
-            top: updatedRect.top - 80, // 80px above the field
-            minWidth: Math.max(updatedRect.width, 280),
-            // Store viewport coords for updates
-            rectLeft: updatedRect.left,
-            rectTop: updatedRect.top,
-          };
-          
-          setEditorPosition(position);
-          setEditingField({
-            key: fieldKey,
-            value: currentValue,
-            element: el,
-            placeholder: placeholder
-          });
-          setEditValue(currentValue);
-        }, 100);
       } else if (onEditField) {
         // Fallback to modal/edit dialog
       onEditField(fieldKey, currentValue);
@@ -294,20 +312,40 @@ export function DocumentPreview({
         `[data-ph="${editingField.key}"], [data-key="${editingField.key}"]`
       ) as HTMLElement;
       
-      if (el) {
+      if (el && previewRef.current) {
         const rect = el.getBoundingClientRect();
+        const containerRect = previewRef.current.getBoundingClientRect();
         
-        // For position:fixed, use viewport coords directly
-        // Update smoothly with transitions
+        // Calculate position relative to container
+        const relativeLeft = rect.left - containerRect.left;
+        const relativeTop = rect.top - containerRect.top;
+        
+        // Ensure editor stays within container boundaries
+        const editorWidth = Math.max(rect.width, 280);
+        const editorHeight = 120;
+        
+        // Constrain horizontal position
+        let constrainedLeft = Math.max(10, relativeLeft);
+        constrainedLeft = Math.min(constrainedLeft, containerRect.width - editorWidth - 10);
+        
+        // Constrain vertical position (prefer above, but below if no space)
+        let constrainedTop = relativeTop - 80;
+        if (constrainedTop < 10) {
+          constrainedTop = relativeTop + rect.height + 10;
+        }
+        if (constrainedTop + editorHeight > containerRect.height - 10) {
+          constrainedTop = containerRect.height - editorHeight - 10;
+        }
+        
         setEditorPosition(prev => {
           if (!prev) return null;
           
           return {
             ...prev,
-            left: rect.left,
-            top: rect.top - 80,
-            rectLeft: rect.left,
-            rectTop: rect.top,
+            left: constrainedLeft,
+            top: constrainedTop,
+            rectLeft: relativeLeft,
+            rectTop: relativeTop,
           };
         });
       }
@@ -382,13 +420,7 @@ export function DocumentPreview({
       </div>
       
       {/* Render the preview HTML with enhanced styling */}
-    <Card className="border-2 border-gray-200 bg-white shadow-sm flex flex-col h-full">
-      <CardHeader className="border-b border-gray-200 bg-gradient-to-r from-primary/5 to-secondary/5">
-        <CardTitle className="flex items-center gap-2">
-          <FileText className="h-5 w-5 text-primary" />
-          <span>Document Preview</span>
-        </CardTitle>
-      </CardHeader>
+    <Card className="border-2 border-gray-200 bg-white shadow-sm flex flex-col h-full relative">
       <CardContent className="flex-1 overflow-hidden p-0">
         <ScrollArea className="h-full w-full p-6">
           <div
@@ -474,13 +506,13 @@ export function DocumentPreview({
         </ScrollArea>
       </CardContent>
       
-      {/* Inline Editor (Canva-like) - Rendered via Portal near clicked field */}
-      {mounted && editingField && editorPosition && createPortal(
+      {/* Inline Editor (Canva-like) - Positioned within document preview */}
+      {mounted && editingField && editorPosition && (
         <div
-          className="inline-edit-wrapper fixed z-[10000] bg-white border-2 border-blue-500 rounded-lg shadow-xl p-2 flex flex-col gap-2"
+          className="inline-edit-wrapper absolute z-[1000] bg-white border-2 border-blue-500 rounded-lg shadow-xl p-2 flex flex-col gap-2"
           style={{
-            left: `${Math.max(10, Math.min((editorPosition.rectLeft ?? editorPosition.left), window.innerWidth - 420))}px`,
-            top: `${Math.max(10, (editorPosition.rectTop ?? editorPosition.top) - 80)}px`,
+            left: `${editorPosition.left}px`,
+            top: `${editorPosition.top}px`,
             minWidth: `${editorPosition.minWidth}px`,
             maxWidth: '400px',
             opacity: 1,
@@ -547,8 +579,7 @@ export function DocumentPreview({
               </Button>
             </div>
           </div>
-        </div>,
-        document.body
+        </div>
       )}
     </Card>
     </div>

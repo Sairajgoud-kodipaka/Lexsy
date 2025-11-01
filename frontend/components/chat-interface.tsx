@@ -56,24 +56,24 @@ export function ChatInterface({
   };
 
   return (
-    <div className="flex flex-col h-full bg-white overflow-hidden">
+    <div className="flex flex-col h-full bg-white dark:bg-slate-900 overflow-hidden">
       {/* HEADER - AI Assistant Title */}
-      <div className="border-b border-slate-200/50 bg-gradient-to-r from-primary/5 to-white backdrop-blur-sm flex-shrink-0">
+      <div className="border-b border-slate-200/50 dark:border-slate-800 bg-white/60 dark:bg-slate-900/60 backdrop-blur-sm flex-shrink-0">
         <div className="p-3">
           <div className="flex items-center gap-2">
-            <div className="rounded-full bg-gradient-to-br from-primary/20 to-primary/10 p-1.5 shadow-sm">
-              <Sparkles className="h-3 w-3 text-primary" />
+            <div className="rounded-full p-1.5 shadow-sm bg-primary/10 text-primary">
+              <Sparkles className="h-3 w-3" />
             </div>
             <div className="flex-1 min-w-0">
-              <h3 className="text-xs font-bold text-slate-900">AI Assistant</h3>
-              <p className="text-xs text-slate-500">Instant guidance</p>
+              <h3 className="text-xs font-bold text-slate-900 dark:text-slate-100">AI Assistant</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">Instant guidance</p>
             </div>
           </div>
         </div>
       </div>
 
       {/* MESSAGES - SCROLLABLE AREA */}
-      <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-hide p-3 bg-slate-50/30 min-h-0">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-hide p-3 bg-slate-50/30 dark:bg-slate-900 min-h-0">
         <div className="space-y-3">
           {/* Show initial message */}
           {messages.length === 0 && initialMessage && (
@@ -83,7 +83,7 @@ export function ChatInterface({
               </div>
               <div className="flex-1 min-w-0">
                 <div
-                  className="text-xs rounded-lg bg-white backdrop-blur-sm p-2 text-slate-700 leading-relaxed shadow-sm border border-slate-200/50 transition-all duration-300 hover:shadow-md"
+                  className="text-xs rounded-lg bg-white dark:bg-slate-800 backdrop-blur-sm p-2 text-slate-700 dark:text-slate-200 leading-relaxed shadow-sm border border-slate-200/50 dark:border-slate-700 transition-all duration-300 hover:shadow-md"
                   dangerouslySetInnerHTML={{ __html: formatMessage(initialMessage) }}
                 />
               </div>
@@ -106,7 +106,7 @@ export function ChatInterface({
                 className={cn(
                   'rounded-full p-1.5 h-fit flex-shrink-0 shadow-sm transition-all duration-200',
                   message.role === 'user'
-                    ? 'bg-gradient-to-br from-primary to-primary/80 text-white'
+                    ? 'bg-primary text-white'
                     : 'bg-primary/10 text-primary'
                 )}
               >
@@ -120,8 +120,8 @@ export function ChatInterface({
                 className={cn(
                   'flex-1 rounded-lg p-2 text-xs leading-relaxed max-w-[85%] transition-all duration-300 shadow-sm border',
                   message.role === 'user'
-                    ? 'bg-gradient-to-br from-primary to-primary/90 text-white border-primary/20 ml-auto hover:shadow-md'
-                    : 'bg-white text-slate-700 border-slate-200/50 hover:shadow-md hover:border-slate-300/50'
+                    ? 'bg-white text-slate-900 border-primary/30 ml-auto hover:shadow-md'
+                    : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200/50 dark:border-slate-700 hover:shadow-md hover:border-slate-300/50'
                 )}
               >
                 <div
@@ -154,7 +154,7 @@ export function ChatInterface({
       </div>
 
       {/* INPUT BOX - AT BOTTOM */}
-      <div className="border-t border-slate-200/50 p-3 bg-gradient-to-t from-slate-50/30 to-white backdrop-blur-sm flex-shrink-0">
+      <div className="border-t border-slate-200/50 dark:border-slate-800 p-3 bg-white/60 dark:bg-slate-900/60 backdrop-blur-sm flex-shrink-0">
         <form onSubmit={handleSubmit} className="flex gap-2 group">
           <Input
             ref={inputRef}
@@ -162,7 +162,7 @@ export function ChatInterface({
             onChange={(e) => setInput(e.target.value)}
             placeholder="Type your answer..."
             disabled={isLoading || disabled}
-            className="text-sm h-9 rounded-xl bg-white border-slate-200/60 transition-all duration-300 focus:border-primary/50 focus:shadow-md focus:ring-0 placeholder:text-slate-400 shadow-sm"
+            className="text-sm h-9 rounded-xl bg-white dark:bg-slate-800 border-slate-200/60 dark:border-slate-700 transition-all duration-300 focus:border-primary/50 focus:shadow-md focus:ring-0 placeholder:text-slate-400 dark:placeholder:text-slate-500 shadow-sm text-slate-900 dark:text-slate-100"
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -173,7 +173,7 @@ export function ChatInterface({
           <Button
             type="submit"
             disabled={!input.trim() || isLoading || disabled}
-            className="h-9 px-3 flex-shrink-0 rounded-xl bg-gradient-to-r from-primary to-primary/90 hover:shadow-md transition-all duration-200 disabled:opacity-50 shadow-sm"
+            className="h-9 px-3 flex-shrink-0 rounded-xl bg-primary hover:shadow-md transition-all duration-200 disabled:opacity-50 shadow-sm"
           >
             {isLoading ? (
               <Loader2 className="h-3 w-3 animate-spin" />

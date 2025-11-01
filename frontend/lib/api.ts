@@ -8,6 +8,19 @@ import type {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
+// Optional auth token (Firebase) injected from UI
+let AUTH_TOKEN: string | null = null;
+export function setAuthToken(token: string | null) {
+  AUTH_TOKEN = token;
+}
+
+function withAuth(headers: HeadersInit = {}): HeadersInit {
+  if (AUTH_TOKEN) {
+    return { ...headers, Authorization: `Bearer ${AUTH_TOKEN}` };
+  }
+  return headers;
+}
+
 class ApiError extends Error {
   constructor(
     public status: number,
@@ -52,6 +65,7 @@ export const api = {
 
     const response = await fetch(`${API_URL}/api/upload`, {
       method: 'POST',
+      headers: withAuth(),
       body: formData,
     });
 
@@ -61,9 +75,7 @@ export const api = {
   async sendMessage(sessionId: string, message: string): Promise<ChatResponse> {
     const response = await fetch(`${API_URL}/api/chat`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: withAuth({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         session_id: sessionId,
         message: message,
@@ -78,6 +90,7 @@ export const api = {
       `${API_URL}/api/preview?session_id=${sessionId}`,
       {
         method: 'GET',
+        headers: withAuth(),
       }
     );
 
@@ -87,9 +100,7 @@ export const api = {
   async completeDocument(sessionId: string): Promise<CompleteResponse> {
     const response = await fetch(`${API_URL}/api/complete`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: withAuth({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         session_id: sessionId,
       }),
@@ -101,6 +112,7 @@ export const api = {
   async downloadDocument(filename: string): Promise<Blob> {
     const response = await fetch(`${API_URL}/api/download/${filename}`, {
       method: 'GET',
+      headers: withAuth(),
     });
 
     if (!response.ok) {
@@ -118,9 +130,7 @@ export const api = {
   async resetSession(sessionId: string): Promise<void> {
     const response = await fetch(`${API_URL}/api/reset`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: withAuth({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         session_id: sessionId,
       }),
@@ -143,9 +153,7 @@ export const api = {
   ): Promise<PreviewResponse> {
     const response = await fetch(`${API_URL}/api/edit`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: withAuth({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         session_id: sessionId,
         field_key: fieldKey,
@@ -157,9 +165,7 @@ export const api = {
   },
 
   async healthCheck(): Promise<{ status: string }> {
-    const response = await fetch(`${API_URL}/api/health`, {
-      method: 'GET',
-    });
+    const response = await fetch(`${API_URL}/api/health`, { method: 'GET', headers: withAuth() });
 
     return handleResponse<{ status: string }>(response);
   },
@@ -175,12 +181,10 @@ export const api = {
     error?: string;
     message?: string;
   }> {
-    const response = await fetch(
-      `${API_URL}/api/session/health?session_id=${sessionId}`,
-      {
-        method: 'GET',
-      }
-    );
+    const response = await fetch(`${API_URL}/api/session/health?session_id=${sessionId}`, {
+      method: 'GET',
+      headers: withAuth(),
+    });
 
     return handleResponse(response);
   },
@@ -197,9 +201,7 @@ export const api = {
   }> {
     const response = await fetch(`${API_URL}/api/fill`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: withAuth({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         session_id: sessionId,
         field_key: fieldKey,
@@ -209,7 +211,117 @@ export const api = {
 
     return handleResponse(response);
   },
+
+  async getAllSessions(limit: number = 100): Promise<{
+    success: boolean;
+    sessions: Array<{
+      session_id: string;
+      filename: string;
+      created_at: string;
+      last_accessed_at: string;
+      progress: number;
+      status: string;
+      placeholders_count: number;
+      filled_count: number;
+    }>;
+    count: number;
+  }> {
+    const response = await fetch(`${API_URL}/api/sessions?limit=${limit}`, {
+      method: 'GET',
+      headers: withAuth(),
+    });
+
+    return handleResponse(response);
+  },
+
+  async getSessionHistory(sessionId: string, limit: number = 50): Promise<{
+    success: boolean;
+    session_id: string;
+    history: Array<{
+      timestamp: string;
+      event_type: string;
+      data: any;
+    }>;
+    count: number;
+  }> {
+    const response = await fetch(
+      `${API_URL}/api/sessions/history?session_id=${sessionId}&limit=${limit}`,
+      {
+        method: 'GET',
+        headers: withAuth(),
+      }
+    );
+
+    return handleResponse(response);
+  },
+
+  async getSessionStats(): Promise<{
+    success: boolean;
+    stats: {
+      total_sessions: number;
+      active_sessions: number;
+      completed_sessions: number;
+      average_progress: number;
+      total_placeholders: number;
+      total_filled: number;
+    };
+  }> {
+    const response = await fetch(`${API_URL}/api/sessions/stats`, {
+      method: 'GET',
+      headers: withAuth(),
+    });
+
+    return handleResponse(response);
+  },
 };
 
 export { ApiError };
+
+// Streaming Groq helper
+export async function streamGroq(
+  prompt: string,
+  onDelta: (chunk: string) => void,
+  model?: string
+): Promise<string> {
+  try {
+    const response = await fetch(`${API_URL}/api/groq/stream`, {
+      method: 'POST',
+      headers: withAuth({ 'Content-Type': 'application/json', Accept: 'text/plain' }),
+      body: JSON.stringify({ prompt, model }),
+    });
+
+    if (!response.ok || !response.body) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let finalText = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      if (chunk) {
+        finalText += chunk;
+        onDelta(chunk);
+      }
+    }
+    return finalText;
+  } catch (err) {
+    // Fallback to non-streaming endpoint
+    const response = await fetch(`${API_URL}/api/groq`, {
+      method: 'POST',
+      headers: withAuth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ prompt, model }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(response.status, 'Groq request failed', text || 'Request failed');
+    }
+    const data = await response.json();
+    const text: string = data.text || '';
+    if (text) onDelta(text);
+    return text;
+  }
+}
 

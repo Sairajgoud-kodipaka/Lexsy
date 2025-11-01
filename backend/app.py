@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 from flask import Flask, render_template, request, jsonify, send_file, session, make_response
+from flask import Response, stream_with_context
+from functools import wraps
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -28,6 +30,8 @@ import secrets
 from services.document_processor import DocumentProcessor
 from services.ai_service import AIService
 from services.placeholder_detector import PlaceholderDetector
+from services.session_manager import session_manager
+from services.firebase_auth import verify_token, get_token_from_request
 
 # Load environment variables from .env file
 load_dotenv()
@@ -43,8 +47,8 @@ app.config['PROCESSED_FOLDER'] = os.environ.get('PROCESSED_FOLDER', 'processed')
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)  # Sessions expire after 24 hours
 
 # Configure CORS for cross-origin requests
-# Allow all localhost origins for development with dynamic origin matching
-allowed_origins = [
+# Build allowed origins from environment for deployment flexibility
+_default_local_origins = [
     'http://localhost:3000',
     'http://localhost:3001',
     'http://localhost:3002',
@@ -53,18 +57,34 @@ allowed_origins = [
     'http://127.0.0.1:3002'
 ]
 
+_env_origins = os.environ.get('CORS_ORIGINS', '').strip()
+_allow_all = os.environ.get('CORS_ALLOW_ALL', 'false').lower() in ('1', 'true', 'yes')
+
+if _allow_all:
+    allowed_origins = '*'
+else:
+    allowed_origins = _default_local_origins.copy()
+    if _env_origins:
+        # Accept comma or whitespace separated list
+        extra = [o.strip() for o in _env_origins.replace('\n', ',').split(',') if o.strip()]
+        allowed_origins.extend(extra)
+
 def cors_check(origin):
-    """Check if origin is allowed"""
+    """Check if origin is allowed. Accept all if wildcard is enabled."""
+    if allowed_origins == '*':
+        return True
     return origin in allowed_origins
 
-CORS(app, 
-     origins=allowed_origins,
-     origin_check=cors_check,
-     supports_credentials=True,
-     methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
-     allow_headers=['Content-Type', 'Authorization', 'X-Requested-With'],
-     expose_headers=['Content-Type', 'Content-Disposition'],
-     max_age=3600)
+CORS(
+    app,
+    origins=allowed_origins,
+    origin_check=cors_check,
+    supports_credentials=True,
+    methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
+    allow_headers=['Content-Type', 'Authorization', 'X-Requested-With'],
+    expose_headers=['Content-Type', 'Content-Disposition'],
+    max_age=3600
+)
 
 # Configure logging
 logging.basicConfig(
@@ -89,12 +109,8 @@ placeholder_detector = PlaceholderDetector()
 # Allowed file extensions for upload
 ALLOWED_EXTENSIONS = {'docx', 'doc'}
 
-# In-memory session store (use Redis in production)
-session_store = {}
-_cleanup_counter = 0  # Track how many saves since last cleanup
-_CLEANUP_INTERVAL = 50  # Run cleanup every 50 saves (reduce overhead)
-_SESSION_TIMEOUT_HOURS = 168  # Sessions expire after 7 days of inactivity (was 24 hours)
-_SESSION_WARNING_HOURS = 6  # Warn if session is inactive for 6+ hours but don't expire yet
+# Session management is now handled by Redis via session_manager
+# (falls back to in-memory if Redis unavailable)
 
 
 def allowed_file(filename: str) -> bool:
@@ -110,108 +126,15 @@ def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+# Session management functions - now use Redis via session_manager
 def get_session_data(session_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Retrieve session data from storage.
-    Updates the last_accessed_at timestamp to prevent premature expiration.
-    
-    Args:
-        session_id (str): Unique session identifier
-        
-    Returns:
-        Optional[Dict]: Session data if found, None otherwise
-    """
-    session_data = session_store.get(session_id)
-    if session_data:
-        # Update last access time to prevent expiration of active sessions
-        session_data['last_accessed_at'] = datetime.now().isoformat()
-        logger.debug(f"Accessed session {session_id[:8]}...")
-    return session_data
+    """Retrieve session data using Redis session manager"""
+    return session_manager.get_session(session_id)
 
 
-def save_session_data(session_id: str, data: Dict[str, Any]) -> None:
-    """
-    Save session data to storage.
-    Updates the last_accessed_at timestamp and runs cleanup periodically.
-    
-    Args:
-        session_id (str): Unique session identifier
-        data (Dict): Session data to save
-    """
-    global _cleanup_counter
-    
-    # Ensure last_accessed_at is always updated
-    data['last_accessed_at'] = datetime.now().isoformat()
-    
-    # Ensure created_at exists (for new sessions)
-    if 'created_at' not in data:
-        data['created_at'] = datetime.now().isoformat()
-    
-    session_store[session_id] = data
-    logger.debug(f"Saved session {session_id[:8]}... (total sessions: {len(session_store)})")
-    
-    # Only run cleanup periodically to reduce overhead
-    _cleanup_counter += 1
-    if _cleanup_counter >= _CLEANUP_INTERVAL:
-        _cleanup_counter = 0
-        cleanup_old_sessions()
-
-
-def cleanup_old_sessions() -> None:
-    """
-    Remove expired sessions from storage.
-    Sessions inactive for more than SESSION_TIMEOUT_HOURS are removed.
-    Uses last_accessed_at if available, otherwise falls back to created_at.
-    """
-    current_time = datetime.now()
-    expired_sessions = []
-    
-    for sid, data in list(session_store.items()):  # Use list() to avoid modification during iteration
-        try:
-            # Use last_accessed_at if available (more accurate for active sessions)
-            # Otherwise fall back to created_at
-            if 'last_accessed_at' in data:
-                last_access = datetime.fromisoformat(data['last_accessed_at'])
-                time_since_access = current_time - last_access
-            elif 'created_at' in data:
-                created_at = datetime.fromisoformat(data['created_at'])
-                time_since_access = current_time - created_at
-            else:
-                # Session without timestamps - should not happen, but log it
-                logger.warning(f"Session {sid[:8]}... has no timestamp, skipping cleanup")
-                continue
-            
-            # Only expire if inactive for more than the timeout period
-            if time_since_access > timedelta(hours=_SESSION_TIMEOUT_HOURS):
-                expired_sessions.append(sid)
-                logger.info(f"Marking session {sid[:8]}... for cleanup (inactive for {time_since_access})")
-        except (KeyError, ValueError) as e:
-            logger.error(f"Error processing session {sid[:8]}... for cleanup: {e}")
-            continue
-    
-    # Clean up expired sessions
-    cleaned_count = 0
-    for sid in expired_sessions:
-        try:
-            if sid in session_store:
-                # Clean up files
-                if 'filepath' in session_store[sid]:
-                    try:
-                        filepath = session_store[sid]['filepath']
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
-                            logger.debug(f"Removed file for expired session {sid[:8]}...")
-                    except OSError as e:
-                        logger.warning(f"Could not remove file for session {sid[:8]}...: {e}")
-                
-                del session_store[sid]
-                cleaned_count += 1
-                logger.info(f"Cleaned up expired session {sid[:8]}...")
-        except Exception as e:
-            logger.error(f"Error cleaning up session {sid[:8]}...: {e}")
-    
-    if cleaned_count > 0:
-        logger.info(f"Cleanup completed: removed {cleaned_count} expired session(s). Active sessions: {len(session_store)}")
+def save_session_data(session_id: str, data: Dict[str, Any], user_id: Optional[str] = None) -> None:
+    """Save session data using Redis session manager"""
+    session_manager.save_session(session_id, data, user_id=user_id)
 
 
 @app.route('/')
@@ -230,7 +153,8 @@ def index():
             '/api/complete',
             '/api/download/<filename>',
             '/api/reset',
-            '/api/health'
+            '/api/health',
+            '/api/groq/stream'
         ]
     })
 
@@ -344,7 +268,24 @@ def upload_document():
             'status': 'active'
         }
         
-        save_session_data(session_id, session_data)
+        # Get user_id from token if available
+        user_id = None
+        token = get_token_from_request(request)
+        if token:
+            user_info = verify_token(token)
+            if user_info:
+                user_id = user_info['uid']
+                logger.info(f"Session linked to user: {user_id}")
+        
+        # Save session (this will also create history entry via session_manager)
+        save_session_data(session_id, session_data, user_id=user_id)
+        # Explicitly add session_created history entry
+        session_manager.add_history(session_id, 'session_created', {
+            'filename': filename,
+            'placeholders_count': len(placeholders),
+            'session_id': session_id,
+            'user_id': user_id
+        })
         
         # Prepare response
         response_data = {
@@ -407,10 +348,11 @@ def chat():
         session_data = get_session_data(session_id)
         if not session_data:
             # Try to get more info for debugging
-            active_sessions = list(session_store.keys())[:5] if session_store else []
+            all_sessions = session_manager.get_all_sessions(limit=5)
+            active_session_ids = [s['session_id'] for s in all_sessions][:5]
             logger.warning(
                 f"Chat request with invalid or expired session_id: {session_id[:8]}... "
-                f"Active sessions: {len(session_store)}. First 5: {[s[:8] + '...' for s in active_sessions]}"
+                f"Active sessions: {len(all_sessions)}. First 5: {[s[:8] + '...' for s in active_session_ids]}"
             )
             return jsonify({
                 'error': 'Session expired',
@@ -696,6 +638,108 @@ def session_health():
             'valid': False,
             'error': 'Health check failed',
             'message': 'An error occurred while checking session status.'
+        }), 500
+
+
+@app.route('/api/sessions', methods=['GET'])
+def get_all_sessions():
+    """
+    Get all active sessions with metadata (filtered by authenticated user).
+    
+    Query params:
+        limit: Maximum number of sessions to return (default: 100)
+    
+    Returns:
+        JSON response with list of sessions
+    """
+    try:
+        limit = int(request.args.get('limit', 100))
+        
+        # Get user_id from token if available
+        user_id = None
+        token = get_token_from_request(request)
+        if token:
+            user_info = verify_token(token)
+            if user_info:
+                user_id = user_info['uid']
+        
+        sessions = session_manager.get_all_sessions(limit=limit, user_id=user_id)
+        
+        return jsonify({
+            'success': True,
+            'sessions': sessions,
+            'count': len(sessions),
+            'user_id': user_id
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting sessions: {str(e)}")
+        return jsonify({
+            'error': 'Failed to retrieve sessions',
+            'message': 'An error occurred while fetching sessions.'
+        }), 500
+
+
+@app.route('/api/sessions/history', methods=['GET'])
+def get_session_history():
+    """
+    Get history for a specific session.
+    
+    Query params:
+        session_id: Session identifier (required)
+        limit: Maximum number of history entries (default: 50)
+    
+    Returns:
+        JSON response with session history
+    """
+    try:
+        session_id = request.args.get('session_id')
+        limit = int(request.args.get('limit', 50))
+        
+        if not session_id:
+            return jsonify({
+                'error': 'No session ID provided',
+                'message': 'Session ID is required.'
+            }), 400
+        
+        history = session_manager.get_session_history(session_id, limit=limit)
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'history': history,
+            'count': len(history)
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting session history: {str(e)}")
+        return jsonify({
+            'error': 'Failed to retrieve history',
+            'message': 'An error occurred while fetching session history.'
+        }), 500
+
+
+@app.route('/api/sessions/stats', methods=['GET'])
+def get_session_stats():
+    """
+    Get overall session statistics.
+    
+    Returns:
+        JSON response with session statistics
+    """
+    try:
+        stats = session_manager.get_session_stats()
+        
+        return jsonify({
+            'success': True,
+            'stats': stats
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting session stats: {str(e)}")
+        return jsonify({
+            'error': 'Failed to retrieve stats',
+            'message': 'An error occurred while fetching statistics.'
         }), 500
 
 
@@ -1052,18 +1096,21 @@ def reset_session():
         data = request.json
         session_id = data.get('session_id')
         
-        if session_id and session_id in session_store:
-            # Clean up uploaded file
-            if 'filepath' in session_store[session_id]:
-                try:
-                    os.remove(session_store[session_id]['filepath'])
-                    logger.info(f"Cleaned up file for session {session_id}")
-                except:
-                    pass
-            
-            # Remove session data
-            del session_store[session_id]
-            logger.info(f"Reset session: {session_id}")
+        if session_id:
+            # Get session data first
+            session_data = get_session_data(session_id)
+            if session_data:
+                # Clean up uploaded file
+                if 'filepath' in session_data:
+                    try:
+                        os.remove(session_data['filepath'])
+                        logger.info(f"Cleaned up file for session {session_id}")
+                    except:
+                        pass
+                
+                # Delete session from Redis
+                session_manager.delete_session(session_id)
+                logger.info(f"Reset session: {session_id}")
         
         return jsonify({
             'success': True,
@@ -1143,20 +1190,141 @@ def after_request(response):
     return response
 
 
-if __name__ == '__main__':
+def _run_app():
     """
     Run the Flask application.
     In production, use Gunicorn or similar WSGI server.
     """
     port = int(os.environ.get('PORT', 5001))  # Default to 5001 to avoid macOS AirPlay conflict
     debug = os.environ.get('FLASK_ENV', 'development') == 'development'
-    
+
     logger.info(f"Starting Legal Document Automation Platform on port {port}")
     logger.info(f"Debug mode: {debug}")
     logger.info(f"CORS enabled for: http://localhost:3000, http://localhost:3001")
-    
+
     app.run(
         host='0.0.0.0',
         port=port,
         debug=debug
     )
+
+"""
+Additional AI (Groq) endpoints
+------------------------------
+Provides a lightweight streaming proxy to Groq as requested, using the
+exact streaming pattern the user provided. Returns plain text chunks.
+"""
+
+try:
+    from groq import Groq  # type: ignore
+    _groq_import_ok = True
+except Exception:
+    _groq_import_ok = False
+
+
+@app.route('/api/groq/stream', methods=['POST'])
+def groq_stream():
+    """
+    Stream a generic AI response from Groq to the client.
+
+    Request JSON:
+      - prompt: string (required)
+      - model: string (optional; default: openai/gpt-oss-120b)
+
+    Response: text/plain streamed chunks containing the model output.
+    """
+    if not _groq_import_ok:
+        return jsonify({
+            'error': 'Groq unavailable',
+            'message': 'groq package not installed on server'
+        }), 500
+
+    try:
+        body = request.get_json(silent=True) or {}
+        prompt = (body.get('prompt') or '').strip()
+        model = body.get('model') or os.environ.get('GROQ_MODEL', 'openai/gpt-oss-120b')
+
+        if not prompt:
+            return jsonify({'error': 'Missing prompt', 'message': 'Provide a non-empty prompt'}), 400
+
+        # Optional auth: accept Firebase token but do not hard-fail if absent
+        token = get_token_from_request(request)
+        if token:
+            _ = verify_token(token)  # Best-effort verification
+
+        client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
+
+        def generate():
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=1,
+                max_completion_tokens=8192,
+                top_p=1,
+                reasoning_effort="medium",
+                stream=True,
+                stop=None,
+            )
+
+            for chunk in completion:
+                try:
+                    text = chunk.choices[0].delta.content or ""
+                except Exception:
+                    text = ""
+                if text:
+                    yield text
+
+        resp = Response(stream_with_context(generate()), mimetype='text/plain')
+        # Extra CORS safety for streaming responses
+        origin = request.headers.get('Origin')
+        if origin in allowed_origins:
+            resp.headers['Access-Control-Allow-Origin'] = origin
+            resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        return resp
+
+    except Exception as e:
+        logger.error(f"Error in Groq stream: {e}")
+        return jsonify({'error': 'Groq stream failed', 'message': str(e)}), 500
+
+
+@app.route('/api/groq', methods=['POST'])
+def groq_complete():
+    """
+    Non-streaming Groq completion (JSON). Used as a fallback when streaming
+    is blocked by the environment. Returns { text }.
+    """
+    if not _groq_import_ok:
+        return jsonify({'error': 'Groq unavailable', 'message': 'groq package not installed'}), 500
+    try:
+        body = request.get_json(silent=True) or {}
+        prompt = (body.get('prompt') or '').strip()
+        model = body.get('model') or os.environ.get('GROQ_MODEL', 'openai/gpt-oss-120b')
+        if not prompt:
+            return jsonify({'error': 'Missing prompt', 'message': 'Provide a non-empty prompt'}), 400
+
+        token = get_token_from_request(request)
+        if token:
+            _ = verify_token(token)
+
+        client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=1,
+            max_completion_tokens=8192,
+            top_p=1,
+            reasoning_effort="medium",
+            stream=False,
+        )
+        text = response.choices[0].message.content or ''
+        return jsonify({ 'text': text })
+    except Exception as e:
+        logger.error(f"Error in Groq complete: {e}")
+        return jsonify({'error': 'Groq request failed', 'message': str(e)}), 500
+
+
+if __name__ == '__main__':
+    _run_app()

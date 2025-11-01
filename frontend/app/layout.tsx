@@ -15,8 +15,25 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="h-full w-full" style={{ backgroundColor: 'hsl(248, 250, 252)', background: 'hsl(248, 250, 252)' }}>
-      <body className={`${inter.className} h-full w-full`} style={{ backgroundColor: 'hsl(248, 250, 252)', background: 'hsl(248, 250, 252)', margin: 0, padding: 0 }}>
+    <html lang="en" suppressHydrationWarning className="h-full w-full">
+      <head>
+        {/* Prevent theme flash */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+(function(){
+  try{
+    var saved = localStorage.getItem('theme');
+    var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if((saved && saved==='dark') || (!saved && prefersDark)){
+      document.documentElement.classList.add('dark');
+    }
+  }catch(e){}
+})();
+`}}
+        />
+      </head>
+      <body className={`${inter.className} h-full w-full`}>
         <div style={{ minHeight: '100vh', height: '100%', width: '100%', backgroundColor: 'hsl(248, 250, 252)', background: 'hsl(248, 250, 252)' }}>
           {children}
         </div>
